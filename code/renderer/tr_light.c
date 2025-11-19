@@ -29,12 +29,20 @@ If you have questions concerning this license or the applicable additional terms
 // tr_light.c
 
 #include "tr_local.h"
+#if defined(_WIN32)
+#include <process.h>	// _beginthreadex
+#else
+#include <threads.h>
+#endif
 
 #define DLIGHT_AT_RADIUS        16
 // at the edge of a dlight's influence, this amount of light will be added
 
 #define DLIGHT_MINIMUM_RADIUS   16
 // never calculate a range less than this to prevent huge light numbers
+
+#define MAX_THREADS 64
+// Maximum number of threads for parallel processing
 
 
 /*
@@ -443,4 +451,91 @@ int R_LightForPoint( vec3_t point, vec3_t ambientLight, vec3_t directedLight, ve
 	VectorCopy( ent.lightDir, lightDir );
 
 	return qtrue;
+}
+
+
+/*
+=============================================================================
+
+MULTITHREADED LIGHTING
+
+=============================================================================
+*/
+
+typedef struct {
+	const trRefdef_t *refdef;
+	int startEntity;
+	int endEntity;
+} lightingWork_t;
+
+#if defined(_WIN32)
+static unsigned __stdcall R_LightingThread(void *data) {
+	lightingWork_t *work = (lightingWork_t *)data;
+	const trRefdef_t *refdef = work->refdef;
+
+	for (int i = work->startEntity; i < work->endEntity; i++) {
+		R_SetupEntityLighting(refdef, &refdef->entities[i]);
+	}
+	return 0;
+}
+#else
+static int R_LightingThread(void *data) {
+	lightingWork_t *work = (lightingWork_t *)data;
+	const trRefdef_t *refdef = work->refdef;
+
+	for (int i = work->startEntity; i < work->endEntity; i++) {
+		R_SetupEntityLighting(refdef, &refdef->entities[i]);
+	}
+	return 0;
+}
+#endif
+
+/*
+=================
+R_SetupEntitiesLighting
+
+Calculates lighting for all entities in parallel.
+=================
+*/
+void R_SetupEntitiesLighting(const trRefdef_t *refdef) {
+	int numThreads = TR_GetHardwareThreadCount();
+	int numEntities = refdef->num_entities;
+
+	if (numThreads > MAX_THREADS) {
+		numThreads = MAX_THREADS;
+	}
+
+	if (numThreads <= 1 || numEntities < 128) { // Don't use threads for small workloads
+		for (int i = 0; i < numEntities; i++) {
+			R_SetupEntityLighting(refdef, &refdef->entities[i]);
+		}
+		return;
+	}
+
+	lightingWork_t work[MAX_THREADS];
+#if defined(_WIN32)
+	HANDLE threads[MAX_THREADS];
+#else
+	thrd_t threads[MAX_THREADS];
+#endif
+
+	for (int i = 0; i < numThreads; i++) {
+		work[i].refdef = refdef;
+		work[i].startEntity = (i * numEntities) / numThreads;
+		work[i].endEntity = ((i + 1) * numEntities) / numThreads;
+#if defined(_WIN32)
+		threads[i] = (HANDLE)_beginthreadex(NULL, 0, R_LightingThread, &work[i], 0, NULL);
+#else
+		thrd_create(&threads[i], R_LightingThread, &work[i]);
+#endif
+	}
+
+	for (int i = 0; i < numThreads; i++) {
+#if defined(_WIN32)
+		WaitForSingleObject(threads[i], INFINITE);
+		CloseHandle(threads[i]);
+#else
+		thrd_join(threads[i], NULL);
+#endif
+	}
 }
