@@ -30,6 +30,13 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "cg_local.h"
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+#include <stdatomic.h>
+#define CG_MARKS_MULTITHREADED
+#endif
+
+
 /*
 ===================================================================
 
@@ -271,6 +278,81 @@ CG_AddMarks
 ===============
 */
 
+#ifdef CG_MARKS_MULTITHREADED
+
+// Максимальное количество потоков для обработки марок.
+// R_GetHardwareThreadCount() обычно возвращает до 128.
+#define MAX_MARK_THREADS 128
+
+typedef struct {
+	markPoly_t **start;
+	int count;
+	int time;
+} mark_thread_arg_t;
+
+static mark_thread_arg_t mark_thread_args[MAX_MARK_THREADS];
+static thrd_t mark_threads[MAX_MARK_THREADS];
+
+static void CG_ProcessMarkPoly(markPoly_t *mp, int time) {
+	int j;
+	int fade;
+	int t;
+
+	// fade out the energy bursts
+	if (mp->markShader == cgs.media.energyMarkShader) {
+		fade = 450 - 450 * ((time - mp->time) / 3000.0f);
+		if (fade < 255) {
+			if (fade < 0) fade = 0;
+			for (j = 0; j < mp->poly.numVerts; j++) {
+				mp->verts[j].modulate[0] = mp->color[0] * fade;
+				mp->verts[j].modulate[1] = mp->color[1] * fade;
+				mp->verts[j].modulate[2] = mp->color[2] * fade;
+			}
+		}
+	}
+
+	// fade in the zombie spirit marks
+	if (mp->markShader == cgs.media.zombieSpiritWallShader) {
+		fade = 255 * ((time - mp->time) / 2000.0f);
+		if (fade < 255) {
+			if (fade < 0) fade = 0;
+			for (j = 0; j < mp->poly.numVerts; j++) {
+				mp->verts[j].modulate[0] = mp->color[0] * fade;
+				mp->verts[j].modulate[1] = mp->color[1] * fade;
+				mp->verts[j].modulate[2] = mp->color[2] * fade;
+			}
+		}
+	}
+
+	// fade all marks out with time
+	t = mp->time + mp->duration - time;
+	if (t < (float)mp->duration / 2.0f) {
+		fade = (int)(255.0f * (float)t / ((float)mp->duration / 2.0f));
+		if (mp->alphaFade) {
+			for (j = 0; j < mp->poly.numVerts; j++) mp->verts[j].modulate[3] = fade;
+		} else {
+			for (j = 0; j < mp->poly.numVerts; j++) {
+				mp->verts[j].modulate[0] = mp->color[0] * fade;
+				mp->verts[j].modulate[1] = mp->color[1] * fade;
+				mp->verts[j].modulate[2] = mp->color[2] * fade;
+			}
+		}
+	}
+}
+
+static int CG_AddMarks_Thread(void *arg) {
+	mark_thread_arg_t *thread_arg = (mark_thread_arg_t *)arg;
+	int i;
+
+	for (i = 0; i < thread_arg->count; i++) {
+		CG_ProcessMarkPoly(thread_arg->start[i], thread_arg->time);
+	}
+
+	return 0;
+}
+
+#endif // CG_MARKS_MULTITHreadED
+
 void CG_AddMarks( void ) {
 	int j;
 	markPoly_t  *mp, *next;
@@ -280,6 +362,73 @@ void CG_AddMarks( void ) {
 	if ( !cg_markTime.integer ) {
 		return;
 	}
+
+#ifdef CG_MARKS_MULTITHREADED
+	{
+		markPoly_t *polys_to_process[MAX_MARK_POLYS];
+		markPoly_t *polys_to_free[MAX_MARK_POLYS];
+		int process_count = 0;
+		int free_count = 0;
+		int num_threads, i, polys_per_thread, remainder;
+		markPoly_t **current_poly_ptr;
+
+		// Stage 1: Collect polygons for processing and removal in the main thread
+		mp = cg_activeMarkPolys.nextMark;
+		while (mp != &cg_activeMarkPolys) {
+			if (cg.time > mp->time + mp->duration) {
+				if (free_count < MAX_MARK_POLYS) {
+					polys_to_free[free_count++] = mp;
+				}
+			} else {
+				if (process_count < MAX_MARK_POLYS) {
+					polys_to_process[process_count++] = mp;
+				}
+			}
+			mp = mp->nextMark;
+		}
+
+		// Stage 2: Parallel processing of polygons
+		if (process_count > 0) {
+			num_threads = CG_GetHardwareThreadCount();
+			if (num_threads > MAX_MARK_THREADS) num_threads = MAX_MARK_THREADS;
+			if (num_threads > process_count) num_threads = process_count;
+			if (num_threads < 1) num_threads = 1;
+
+			polys_per_thread = process_count / num_threads;
+			remainder = process_count % num_threads;
+			current_poly_ptr = polys_to_process;
+
+			for (i = 0; i < num_threads; i++) {
+				mark_thread_args[i].start = current_poly_ptr;
+				mark_thread_args[i].count = polys_per_thread + (i < remainder ? 1 : 0);
+				mark_thread_args[i].time = cg.time;
+				current_poly_ptr += mark_thread_args[i].count;
+				thrd_create(&mark_threads[i], CG_AddMarks_Thread, &mark_thread_args[i]);
+			}
+
+			for (i = 0; i < num_threads; i++) {
+				thrd_join(mark_threads[i], NULL);
+			}
+		}
+
+		// Stage 3: Add to scene and free memory in the main thread
+		for (i = 0; i < process_count; i++) {
+			mp = polys_to_process[i];
+			trap_R_AddPolyToScene(mp->markShader, mp->poly.numVerts, mp->verts);
+		}
+
+		for (i = 0; i < free_count; i++) {
+			CG_FreeMarkPoly(polys_to_free[i]);
+		}
+
+		return;
+	}
+#endif
+
+	// =================================================================
+	// Original single-threaded code, which will be used
+	// if the compiler does not support C11 threads.
+	// =================================================================
 
 	mp = cg_activeMarkPolys.nextMark;
 	for ( ; mp != &cg_activeMarkPolys ; mp = next ) {
@@ -349,4 +498,3 @@ void CG_AddMarks( void ) {
 		trap_R_AddPolyToScene( mp->markShader, mp->poly.numVerts, mp->verts );
 	}
 }
-

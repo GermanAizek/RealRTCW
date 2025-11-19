@@ -39,12 +39,6 @@ If you have questions concerning this license or the applicable additional terms
 #endif
 #include <stdatomic.h>
 #include <stdlib.h>
-// Platform-specific headers for getting CPU core count
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__unix__) || defined(__APPLE__)
-#include <unistd.h>
-#endif
 
 #define MAX_VERTS_ON_POLY       64
 
@@ -891,21 +885,6 @@ static int R_MarkFragments_Worker(void *data)
 	return thread_data->returnedFragments;
 }
 
-// Helper function to get the number of logical processors in a cross-platform way.
-static int R_GetHardwareThreadCount(void) {
-	int num_processors = 1; // Default to 1
-#if defined(_WIN32)
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-	num_processors = sysinfo.dwNumberOfProcessors;
-#elif defined(__unix__) || defined(__APPLE__)
-	num_processors = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-	if (num_processors < 1) {
-		return 1;
-	}
-	return num_processors;
-}
 /*
 =================
 R_MarkFragments
@@ -916,7 +895,7 @@ Public facing function, dispatches work to threads.
 int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t projection,
 					 int maxPoints, vec3_t pointBuffer, int maxFragments, markFragment_t *fragmentBuffer ) {
 
-	int numThreads = R_GetHardwareThreadCount();
+	int numThreads = TR_GetHardwareThreadCount();
 
 	qboolean oldMapping = qfalse;
 	if ( maxFragments < 0 ) {

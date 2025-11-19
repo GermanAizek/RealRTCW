@@ -31,6 +31,29 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_types.h"
 
+// Platform-specific headers for getting CPU core count
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
+// Helper function to get the number of logical processors in a cross-platform way.
+static int TR_GetHardwareThreadCount(void) {
+	int num_processors = 1; // Default to 1
+#if defined(_WIN32)
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	num_processors = sysinfo.dwNumberOfProcessors;
+#elif defined(__unix__) || defined(__APPLE__)
+	num_processors = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+	if (num_processors < 1) {
+		return 1;
+	}
+	return num_processors;
+}
+
 #define REF_API_VERSION     8
 
 //
