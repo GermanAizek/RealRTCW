@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 // tr_map.c
 
 #include "tr_local.h"
+#include <threads.h>
 
 // Fix for potential lightgrid mismatches while building with MSYS2
 #pragma GCC optimize ("no-fast-math")
@@ -135,6 +136,21 @@ static void R_ColorShiftLightingBytes( byte in[4], byte out[4] ) {
 }
 
 /*
+================
+R_ProcessLightmapChunk
+
+Thread function to process a chunk of lightmaps
+================
+*/
+typedef struct {
+	int start;
+	int end;
+	byte *buf;
+	float *maxIntensity;
+	double *sumIntensity;
+} lightmap_thread_data_t;
+
+/*
 ===============
 R_LoadLightmaps
 
@@ -142,13 +158,10 @@ R_LoadLightmaps
 */
 #define LIGHTMAP_SIZE   128
 static void R_LoadLightmaps( lump_t *l ) {
-	byte        *buf, *buf_p;
+	byte        *buf;
 	int len;
-	byte image[LIGHTMAP_SIZE * LIGHTMAP_SIZE * 4];
-	int i, j;
-	float maxIntensity = 0;
-	double sumIntensity = 0;
-
+	int i;
+	
 	len = l->filelen;
 	if ( !len ) {
 		return;
@@ -171,54 +184,112 @@ static void R_LoadLightmaps( lump_t *l ) {
 		return;
 	}
 
-	tr.lightmaps = ri.Hunk_Alloc( tr.numLightmaps * sizeof(image_t *), h_low );
-	for ( i = 0 ; i < tr.numLightmaps ; i++ ) {
-		// expand the 24 bit on-disk to 32 bit
-		buf_p = buf + i * LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3;
+	tr.lightmaps = ri.Hunk_Alloc( tr.numLightmaps * sizeof( image_t * ), h_low );
 
-		if ( r_lightmap->integer == 2 ) { // color code by intensity as development tool	(FIXME: check range)
-			for ( j = 0; j < LIGHTMAP_SIZE * LIGHTMAP_SIZE; j++ )
-			{
-				float r = buf_p[j * 3 + 0];
-				float g = buf_p[j * 3 + 1];
-				float b = buf_p[j * 3 + 2];
-				float intensity;
-				float out[3] = {0.0, 0.0, 0.0};
+	int numThreads = TR_GetHardwareThreadCount();
+	if (numThreads > tr.numLightmaps) {
+		numThreads = tr.numLightmaps;
+	}
+	if (numThreads < 1) {
+		numThreads = 1;
+	}
 
-				intensity = 0.33f * r + 0.685f * g + 0.063f * b;
+	thrd_t *threads = ri.Hunk_Alloc( numThreads * sizeof( thrd_t ), h_high );
+	lightmap_thread_data_t *thread_data = ri.Hunk_Alloc( numThreads * sizeof( lightmap_thread_data_t ), h_high );
+	float *maxIntensities = ri.Hunk_Alloc( numThreads * sizeof(float), h_high );
+	double *sumIntensities = ri.Hunk_Alloc( numThreads * sizeof(double), h_high );
 
-				if ( intensity > 255 ) {
-					intensity = 1.0f;
-				} else {
-					intensity /= 255.0f;
+	int lightmapsPerThread = ( tr.numLightmaps + numThreads - 1 ) / numThreads;
+
+	int process_lightmaps_chunk(void *arg) {
+		lightmap_thread_data_t *data = (lightmap_thread_data_t *)arg;
+		byte image[LIGHTMAP_SIZE * LIGHTMAP_SIZE * 4];
+		float maxIntensity = 0;
+		double sumIntensity = 0;
+		int i, j;
+
+		for ( i = data->start; i < data->end; i++ ) {
+			byte *buf_p = data->buf + i * LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3;
+
+			if ( r_lightmap->integer == 2 ) { // color code by intensity as development tool	(FIXME: check range)
+				for ( j = 0; j < LIGHTMAP_SIZE * LIGHTMAP_SIZE; j++ )
+				{
+					float r = buf_p[j * 3 + 0];
+					float g = buf_p[j * 3 + 1];
+					float b = buf_p[j * 3 + 2];
+					float intensity;
+					float out[3] = {0.0, 0.0, 0.0};
+
+					intensity = 0.33f * r + 0.685f * g + 0.063f * b;
+
+					if ( intensity > 255 ) {
+						intensity = 1.0f;
+					} else {
+						intensity /= 255.0f;
+					}
+
+					if ( intensity > maxIntensity ) {
+						maxIntensity = intensity;
+					}
+
+					HSVtoRGB( intensity, 1.00, 0.50, out );
+
+					image[j * 4 + 0] = out[0] * 255;
+					image[j * 4 + 1] = out[1] * 255;
+					image[j * 4 + 2] = out[2] * 255;
+					image[j * 4 + 3] = 255;
+
+					sumIntensity += intensity;
 				}
-
-				if ( intensity > maxIntensity ) {
-					maxIntensity = intensity;
+			} else {
+				for ( j = 0 ; j < LIGHTMAP_SIZE * LIGHTMAP_SIZE; j++ ) {
+					R_ColorShiftLightingBytes( &buf_p[j * 3], &image[j * 4] );
+					image[j * 4 + 3] = 255;
 				}
-
-				HSVtoRGB( intensity, 1.00, 0.50, out );
-
-				image[j * 4 + 0] = out[0] * 255;
-				image[j * 4 + 1] = out[1] * 255;
-				image[j * 4 + 2] = out[2] * 255;
-				image[j * 4 + 3] = 255;
-
-				sumIntensity += intensity;
 			}
-		} else {
-			for ( j = 0 ; j < LIGHTMAP_SIZE * LIGHTMAP_SIZE; j++ ) {
-				R_ColorShiftLightingBytes( &buf_p[j * 3], &image[j * 4] );
-				image[j * 4 + 3] = 255;
-			}
+			// R_CreateImage is not thread-safe, so we store the pointer and create images later
+			tr.lightmaps[i] = (image_t *)ri.Hunk_Alloc( sizeof(image), h_high );
+			memcpy(tr.lightmaps[i], image, sizeof(image));
 		}
-		tr.lightmaps[i] = R_CreateImage( va( "*lightmap%d",i ), image,
-			LIGHTMAP_SIZE, LIGHTMAP_SIZE, IMGTYPE_COLORALPHA,
-			IMGFLAG_NOLIGHTSCALE | IMGFLAG_NO_COMPRESSION | IMGFLAG_CLAMPTOEDGE, 0 );
+
+		*data->maxIntensity = maxIntensity;
+		*data->sumIntensity = sumIntensity;
+
+		return 0;
+	}
+
+	for ( i = 0; i < numThreads; i++ ) {
+		thread_data[i].start = i * lightmapsPerThread;
+		thread_data[i].end = ( i + 1 ) * lightmapsPerThread;
+		if ( thread_data[i].end > tr.numLightmaps ) {
+			thread_data[i].end = tr.numLightmaps;
+		}
+		thread_data[i].buf = buf;
+		thread_data[i].maxIntensity = &maxIntensities[i];
+		thread_data[i].sumIntensity = &sumIntensities[i];
+		maxIntensities[i] = 0;
+		sumIntensities[i] = 0;
+
+		thrd_create( &threads[i], process_lightmaps_chunk, &thread_data[i] );
+	}
+
+	float totalMaxIntensity = 0;
+	for ( i = 0; i < numThreads; i++ ) {
+		thrd_join( threads[i], NULL );
+		if (maxIntensities[i] > totalMaxIntensity) {
+			totalMaxIntensity = maxIntensities[i];
+		}
+	}
+
+	// Now create the images in the main thread
+	for (i = 0; i < tr.numLightmaps; i++) {
+		tr.lightmaps[i] = R_CreateImage( va( "*lightmap%d", i ), (byte *)tr.lightmaps[i],
+										 LIGHTMAP_SIZE, LIGHTMAP_SIZE, IMGTYPE_COLORALPHA,
+										 IMGFLAG_NOLIGHTSCALE | IMGFLAG_NO_COMPRESSION | IMGFLAG_CLAMPTOEDGE, 0 );
 	}
 
 	if ( r_lightmap->integer == 2 ) {
-		ri.Printf( PRINT_ALL, "Brightest lightmap value: %d\n", ( int ) ( maxIntensity * 255 ) );
+		ri.Printf( PRINT_ALL, "Brightest lightmap value: %d\n", ( int ) ( totalMaxIntensity * 255 ) );
 	}
 }
 
@@ -2478,4 +2549,3 @@ void RE_LoadWorldMap( const char *name ) {
 //----(SA)	end
 	ri.FS_FreeFile( buffer.v );
 }
-
