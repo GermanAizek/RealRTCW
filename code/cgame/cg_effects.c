@@ -31,6 +31,13 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "cg_local.h"
 
+// C11 threads for cross-platform multithreading
+#if defined(__STDC_NO_THREADS__)
+#error "C11 Threads are not supported"
+#else
+#include <threads.h>
+#endif
+
 
 /*
 ==================
@@ -2258,6 +2265,26 @@ CG_S_AddLoopingSound(cent->currentState.number, cent->lerpOrigin, vec3_origin, w
 	}
 }
 
+typedef struct {
+	smokesprite_t **sprites;
+	int start;
+	int end;
+	float dist;
+} SmokePhysicsThreadData;
+
+int CG_SmokeSpritePhysics_Thread(void *arg) {
+	SmokePhysicsThreadData *data = (SmokePhysicsThreadData *)arg;
+	int i;
+
+	for (i = data->start; i < data->end; ++i) {
+		// Do physics, but don't deallocate here.
+		// The main thread will handle deallocation.
+		CG_SmokeSpritePhysics(data->sprites[i], data->dist);
+	}
+
+	return 0;
+}
+
 void CG_AddSmokeSprites( void ) {
 	smokesprite_t *smokesprite;
 	qhandle_t shader;
@@ -2269,19 +2296,72 @@ void CG_AddSmokeSprites( void ) {
 	float halfSmokeSpriteWidth, halfSmokeSpriteHeight;
 	float dist = SMOKEBOMB_SMOKEVELOCITY * cg.frametime;
 
+	int num_threads = CG_GetHardwareThreadCount();
+	smokesprite_t *sprite_pointers[MAX_SMOKESPRITES];
+	int sprite_count = 0;
+	int i;
+
+	// Collect all sprites to process
 	smokesprite = lastusedsmokesprite;
 	while( smokesprite ) {
+		sprite_pointers[sprite_count++] = smokesprite;
+		smokesprite = smokesprite->prev;
+	}
+
+	if (sprite_count == 0) {
+		return;
+	}
+
+	// Distribute work among threads
+	if (num_threads > 1 && sprite_count > 128) {
+		thrd_t threads[num_threads];
+		SmokePhysicsThreadData thread_data[num_threads];
+		int sprites_per_thread = (sprite_count + num_threads - 1) / num_threads;
+		int active_threads = 0;
+
+		for (i = 0; i < num_threads; ++i) {
+			thread_data[i].sprites = sprite_pointers;
+			thread_data[i].start = i * sprites_per_thread;
+			thread_data[i].end = (i + 1) * sprites_per_thread;
+			if (thread_data[i].start >= sprite_count) {
+				thread_data[i].start = thread_data[i].end = sprite_count;
+			}
+			if (thread_data[i].end > sprite_count) {
+				thread_data[i].end = sprite_count;
+			}
+			thread_data[i].dist = dist;
+
+			if (thrd_create(&threads[i], CG_SmokeSpritePhysics_Thread, &thread_data[i]) != thrd_success) {
+				// Fallback to single-threaded on failure
+				num_threads = 1;
+				// Join any threads that were successfully created before the failure
+				for (int j = 0; j < active_threads; ++j) {
+					thrd_join(threads[j], NULL);
+				}
+				break;
+			}
+			active_threads++;
+		}
+
+		for (i = 0; i < active_threads; ++i) {
+			thrd_join(threads[i], NULL);
+		}
+	}
+
+	// Iterate backwards for safe removal and rendering
+	for (i = sprite_count - 1; i >= 0; --i) {
+		smokesprite = sprite_pointers[i];
+
 		if( smokesprite->smokebomb && !smokesprite->smokebomb->currentValid ) {
-			smokesprite = smokesprite->prev;
 			continue;
 		}
 
 		// Do physics
-		if( !CG_SmokeSpritePhysics( smokesprite, dist ) ) {
-			if( smokesprite->smokebomb )
-				smokesprite->smokebomb->miscTime--;
-			smokesprite = DeAllocSmokeSprite( smokesprite );
-			continue;
+		if (num_threads <= 1 || sprite_count <= 128) { // If not threaded, do physics now
+			if (!CG_SmokeSpritePhysics(smokesprite, dist)) {
+				// This can happen if the sprite spawns in a solid.
+				// The main loop below will catch it and dealloc.
+			}
 		}
 
 		if( smokesprite->smokebomb )
@@ -2293,11 +2373,11 @@ void CG_AddSmokeSprites( void ) {
 			radius = 640.f;	// max radius
 
 		// Expire sprites
-		if( smokesprite->dist > radius * .5f ) {
-			if( smokesprite->smokebomb )
+		if( smokesprite->dist > radius * .5f || !CG_SmokeSpritePhysics(smokesprite, 0) ) { // Second check is for sprites that spawned in solid
+			if( smokesprite->smokebomb ) {
 				smokesprite->smokebomb->miscTime--;
-
-			smokesprite = DeAllocSmokeSprite( smokesprite );
+			}
+			DeAllocSmokeSprite( smokesprite );
 			continue;
 		}
 
@@ -2347,7 +2427,5 @@ void CG_AddSmokeSprites( void ) {
 		shader = cgs.media.smokePuffShader;
 
 		trap_R_AddPolyToScene( shader, 4, verts );
-
-		smokesprite = smokesprite->prev;
 	}
 }
