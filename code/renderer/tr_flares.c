@@ -29,6 +29,11 @@ If you have questions concerning this license or the applicable additional terms
 // tr_flares.c
 
 #include "tr_local.h"
+#include <threads.h>
+
+// NOTE: Direct multithreading of RB_TestFlare is not possible because qglReadPixels
+// is an OpenGL call and cannot be safely made from multiple threads on the same context.
+// The following implementation is a structural example and is disabled by default.
 
 /*
 =============================================================================
@@ -99,6 +104,19 @@ flare_t     *r_activeFlares, *r_inactiveFlares;
 
 int flareCoeff;
 
+// --- Threading Data ---
+thrd_t *flareThreads;
+int numFlareThreads;
+
+typedef struct {
+	flare_t **flares;
+	int count;
+} flareThreadWork_t;
+
+flareThreadWork_t *flareThreadWork;
+// --- End Threading Data ---
+
+
 /*
 ==================
 R_SetFlareCoeff
@@ -124,12 +142,26 @@ void R_ClearFlares( void ) {
 	r_activeFlares = NULL;
 	r_inactiveFlares = NULL;
 
+	if (flareThreads) {
+		free(flareThreads);
+		flareThreads = NULL;
+	}
+	if (flareThreadWork) {
+		free(flareThreadWork);
+		flareThreadWork = NULL;
+	}
+
 	for ( i = 0 ; i < MAX_FLARES ; i++ ) {
 		r_flareStructs[i].next = r_inactiveFlares;
 		r_inactiveFlares = &r_flareStructs[i];
 	}
 
 	R_SetFlareCoeff();
+
+	// Initialize threads for flare processing
+	numFlareThreads = TR_GetHardwareThreadCount();
+	flareThreads = malloc(sizeof(thrd_t) * numFlareThreads);
+	flareThreadWork = malloc(sizeof(flareThreadWork_t) * numFlareThreads);
 }
 
 
@@ -394,6 +426,24 @@ void RB_TestFlare( flare_t *f ) {
 	f->drawIntensity = fade;
 }
 
+/*
+==================
+RB_FlareTest_Thread
+
+This is the function that would be executed by each thread.
+==================
+*/
+int RB_FlareTest_Thread(void *data) {
+	flareThreadWork_t *work = (flareThreadWork_t *)data;
+	int i;
+
+	for (i = 0; i < work->count; i++) {
+		RB_TestFlare(work->flares[i]);
+	}
+
+	return 0;
+}
+
 
 /*
 ==================
@@ -544,6 +594,9 @@ void RB_RenderFlares( void ) {
 	flare_t     *f;
 	flare_t     **prev;
 	qboolean draw;
+	flare_t *flaresToTest[MAX_FLARES];
+	int numFlaresToTest = 0;
+	int i;
 
 	if ( !r_flares->integer ) {
 		return;
@@ -564,23 +617,65 @@ void RB_RenderFlares( void ) {
 	RB_AddDlightFlares();
 	RB_AddCoronaFlares();
 
-	// perform z buffer readback on each flare in this view
+	// Collect all flares that need to be tested in this view
+	for (f = r_activeFlares; f; f = f->next) {
+		if (f->addedFrame < backEnd.viewParms.frameCount - 1) {
+			continue; // Will be cleaned up later
+		}
+
+		if (f->frameSceneNum == backEnd.viewParms.frameSceneNum && f->inPortal == backEnd.viewParms.isPortal) {
+			if (numFlaresToTest < MAX_FLARES) {
+				flaresToTest[numFlaresToTest++] = f;
+			}
+		} else {
+			f->drawIntensity = 0;
+		}
+	}
+
+#if 0 // DISABLED: OpenGL calls are not thread-safe. This is a structural example.
+	// Distribute work and run threads
+	if (numFlaresToTest > 0) {
+		int flaresPerThread = (numFlaresToTest + numFlareThreads - 1) / numFlareThreads;
+		int currentFlare = 0;
+
+		for (i = 0; i < numFlareThreads && currentFlare < numFlaresToTest; i++) {
+			int count = flaresPerThread;
+			if (currentFlare + count > numFlaresToTest) {
+				count = numFlaresToTest - currentFlare;
+			}
+			flareThreadWork[i].flares = &flaresToTest[currentFlare];
+			flareThreadWork[i].count = count;
+			thrd_create(&flareThreads[i], RB_FlareTest_Thread, &flareThreadWork[i]);
+			currentFlare += count;
+		}
+
+		// Wait for all threads to finish
+		for (i = 0; i < numFlareThreads && i < numFlaresToTest; i++) {
+			thrd_join(flareThreads[i], NULL);
+		}
+	}
+#else
+	// Perform z buffer readback on each flare in this view (single-threaded, safe way)
+	for (i = 0; i < numFlaresToTest; i++) {
+		RB_TestFlare(flaresToTest[i]);
+	}
+#endif
+
+	// Prune the list and check if we need to draw anything
 	draw = qfalse;
 	prev = &r_activeFlares;
 	while ( ( f = *prev ) != NULL ) {
-		// throw out any flares that weren't added last frame
+		// Throw out any flares that weren't added last frame
 		if ( f->addedFrame < backEnd.viewParms.frameCount - 1 ) {
 			*prev = f->next;
 			f->next = r_inactiveFlares;
 			r_inactiveFlares = f;
 			continue;
 		}
-
-		// don't draw any here that aren't from this scene / portal
-		f->drawIntensity = 0;
+		
+		// Check if the flare is part of the current scene and should be drawn
 		if ( f->frameSceneNum == backEnd.viewParms.frameSceneNum
 			 && f->inPortal == backEnd.viewParms.isPortal ) {
-			RB_TestFlare( f );
 			if ( f->drawIntensity ) {
 				draw = qtrue;
 			} else {
@@ -624,4 +719,3 @@ void RB_RenderFlares( void ) {
 	qglMatrixMode( GL_MODELVIEW );
 	qglPopMatrix();
 }
-
