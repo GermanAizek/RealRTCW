@@ -29,6 +29,9 @@ If you have questions concerning this license or the applicable additional terms
 // Ridah, cg_trails.c - draws a trail using multiple junction points
 
 #include "cg_local.h"
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+#endif
 
 typedef struct trailJunc_s
 {
@@ -725,6 +728,51 @@ void CG_AddTrailToScene( trailJunc_t *trail, int iteration, int numJuncs ) {
 
 }
 
+typedef struct {
+	trailJunc_t **juncs;
+	int start;
+	int end;
+	int time;
+} trail_thread_data_t;
+
+/*
+===============
+CG_UpdateTrailsInRange
+
+ Thread worker function to update a range of trail junctions.
+===============
+*/
+int CG_UpdateTrailsInRange( void *arg ) {
+	trail_thread_data_t *data = (trail_thread_data_t *)arg;
+	int i;
+	float lifeFrac;
+
+	for ( i = data->start; i < data->end; i++ ) {
+		trailJunc_t *j = data->juncs[i];
+
+		lifeFrac = (float)( data->time - j->spawnTime ) / (float)( j->endTime - j->spawnTime );
+		if ( lifeFrac >= 1.0 ) {
+			j->inuse = qfalse; // flag it as dead
+			j->width = j->widthEnd;
+			j->alpha = j->alphaEnd > 1.0f ? 1.0f : (j->alphaEnd < 0.0f ? 0.0f : j->alphaEnd);
+			VectorCopy( j->colorEnd, j->color );
+		} else {
+			j->width = j->widthStart + ( j->widthEnd - j->widthStart ) * lifeFrac;
+			j->alpha = j->alphaStart + ( j->alphaEnd - j->alphaStart ) * lifeFrac;
+			if ( j->alpha > 1.0f ) {
+				j->alpha = 1.0f;
+			} else if ( j->alpha < 0.0f ) {
+				j->alpha = 0.0f;
+			}
+			VectorSubtract( j->colorEnd, j->colorStart, j->color );
+			VectorMA( j->colorStart, lifeFrac, j->color, j->color );
+		}
+	}
+
+	return 0;
+}
+
+
 /*
 ===============
 CG_AddTrails
@@ -743,34 +791,56 @@ void CG_AddTrails( void ) {
 	VectorCopy( cg.refdef.viewaxis[1], trailOrientation.vright );
 	VectorCopy( cg.refdef.viewaxis[2], trailOrientation.vup );
 
-	// update the settings for each junc
-	j = activeTrails;
-	while ( j ) {
-		lifeFrac = (float)( cg.time - j->spawnTime ) / (float)( j->endTime - j->spawnTime );
-		if ( lifeFrac >= 1.0 ) {
-			j->inuse = qfalse;          // flag it as dead
-			j->width = j->widthEnd;
-			j->alpha = j->alphaEnd;
-			if ( j->alpha > 1.0 ) {
-				j->alpha = 1.0;
-			} else if ( j->alpha < 0.0 ) {
-				j->alpha = 0.0;
-			}
-			VectorCopy( j->colorEnd, j->color );
-		} else {
-			j->width = j->widthStart + ( j->widthEnd - j->widthStart ) * lifeFrac;
-			j->alpha = j->alphaStart + ( j->alphaEnd - j->alphaStart ) * lifeFrac;
-			if ( j->alpha > 1.0 ) {
-				j->alpha = 1.0;
-			} else if ( j->alpha < 0.0 ) {
-				j->alpha = 0.0;
-			}
-			VectorSubtract( j->colorEnd, j->colorStart, j->color );
-			VectorMA( j->colorStart, lifeFrac, j->color, j->color );
-		}
+	// Multithreaded update of trail junctions
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+	if ( numTrailsInuse > 128 ) { // Only use threads for a significant amount of trails
+		int numThreads = CG_GetHardwareThreadCount();
+		if ( numThreads > 1 && numThreads <= MAX_TRAILJUNCS ) {
+			thrd_t threads[MAX_TRAILJUNCS];
+			trail_thread_data_t thread_data[MAX_TRAILJUNCS];
+			trailJunc_t *junc_pointers[MAX_TRAILJUNCS];
+			int i, count = 0;
 
-		j = j->nextGlobal;
+			// Collect active junctions into an array for easy partitioning
+			for ( j = activeTrails; j && count < MAX_TRAILJUNCS; j = j->nextGlobal ) {
+				junc_pointers[count++] = j;
+			}
+
+			int juncsPerThread = count / numThreads;
+			int remainder = count % numThreads;
+			int start = 0;
+
+			for ( i = 0; i < numThreads; i++ ) {
+				int num_juncs_for_thread = juncsPerThread + ( i < remainder ? 1 : 0 );
+				if ( num_juncs_for_thread == 0 ) {
+					numThreads = i; // No more work to distribute
+					break;
+				}
+
+				thread_data[i].juncs = junc_pointers;
+				thread_data[i].start = start;
+				thread_data[i].end = start + num_juncs_for_thread;
+				thread_data[i].time = cg.time;
+
+				thrd_create( &threads[i], CG_UpdateTrailsInRange, &thread_data[i] );
+				start += num_juncs_for_thread;
+			}
+
+			for ( i = 0; i < numThreads; i++ ) {
+				thrd_join( threads[i], NULL );
+			}
+
+			goto post_update;
+		}
 	}
+#endif
+
+	// Single-threaded fallback
+	for ( j = activeTrails; j; j = j->nextGlobal ) {
+		CG_UpdateTrailsInRange(&(trail_thread_data_t){ .juncs = &j, .start = 0, .end = 1, .time = cg.time });
+	}
+
+post_update:
 
 	// draw the trailHeads
 	j = headTrails;
