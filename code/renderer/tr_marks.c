@@ -31,6 +31,21 @@ If you have questions concerning this license or the applicable additional terms
 #include "tr_local.h"
 //#include "assert.h"
 
+// C11 Threads for cross-platform multithreading
+#if defined(__STDC_NO_THREADS__)
+#error "C11 Threads are not supported"
+#else
+#include <threads.h>
+#endif
+#include <stdatomic.h>
+#include <stdlib.h>
+// Platform-specific headers for getting CPU core count
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 #define MAX_VERTS_ON_POLY       64
 
 #define MARKER_OFFSET           0   // 1
@@ -218,7 +233,7 @@ R_AddMarkFragments
 */
 void R_AddMarkFragments( int numClipPoints, vec3_t clipPoints[2][MAX_VERTS_ON_POLY],
 						 int numPlanes, vec3_t *normals, float *dists,
-						 int maxPoints, vec3_t pointBuffer,
+						 int maxPoints, float *pointBuffer,
 						 int maxFragments, markFragment_t *fragmentBuffer,
 						 int *returnedPoints, int *returnedFragments,
 						 vec3_t mins, vec3_t maxs ) {
@@ -481,17 +496,43 @@ int R_OldMarkFragments( int numPoints, const vec3_t *points, const vec3_t projec
 	return returnedFragments;
 }
 
+// =================================================================================
+// Multithreading implementation for R_MarkFragments
+// =================================================================================
+
+// Structure to pass arguments to each worker thread
+typedef struct {
+	int threadId;
+	int numThreads;
+	int orientation;
+	const vec3_t *points;
+	vec3_t projection;
+	int maxPoints;
+	int maxFragments;
+	qboolean oldMapping;
+
+	surfaceType_t **surfaces;
+	int numsurfaces;
+
+	// Thread-local storage for results
+	float *pointBuffer;
+	markFragment_t *fragmentBuffer;
+	int returnedPoints;
+	int returnedFragments;
+} mark_thread_data_t;
+
 /*
 =================
 R_MarkFragments
 
 =================
 */
-int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t projection,
-					 int maxPoints, vec3_t pointBuffer, int maxFragments, markFragment_t *fragmentBuffer ) {
-	int numsurfaces, numPlanes;
+static int R_MarkFragments_Internal( int orientation, const vec3_t *points, const vec3_t projection,
+					 int maxPoints, float *pointBuffer, int maxFragments, markFragment_t *fragmentBuffer,
+					 int threadId, int numThreads, qboolean oldMapping,
+					 surfaceType_t **surfaces, int numsurfaces ) {
+	int numPlanes;
 	int i, j, k, m, n;
-	surfaceType_t   *surfaces[4096];
 	vec3_t mins, maxs;
 	int returnedFragments;
 	int returnedPoints;
@@ -507,22 +548,14 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 	vec3_t v1, v2;
 	int             *indexes;
 	float radius;
+
 	vec3_t center;          // center of original mark
 	int numPoints = 4;              // Ridah, we were only ever passing in 4, so I made this local and used the parameter for the orientation
-	qboolean oldMapping = qfalse;
 
 	if (numPoints <= 0) {
 		return 0;
 	}
 
-	//increment view count for double check prevention
-	tr.viewCount++;
-
-	// RF, negative maxFragments means we want original mapping
-	if ( maxFragments < 0 ) {
-		maxFragments = -maxFragments;
-		oldMapping = qtrue;
-	}
 
 	VectorClear( center );
 	for ( i = 0 ; i < numPoints ; i++ ) {
@@ -566,8 +599,6 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 	dists[numPoints + 1] = DotProduct( normals[numPoints + 1], points[0] ) - radius * ( 1 + oldMapping * 10 );
 	numPlanes = numPoints + 2;
 
-	numsurfaces = 0;
-	R_BoxSurfaces_r( tr.world->nodes, mins, maxs, surfaces, 4096, &numsurfaces, projectionDir );
 
 	returnedPoints = 0;
 	returnedFragments = 0;
@@ -577,7 +608,12 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 		VectorNegate( bestnormal, bestnormal );
 	}
 
-	for ( i = 0 ; i < numsurfaces ; i++ ) {
+	// Each thread processes a subset of surfaces
+	int startSurface = (numsurfaces * threadId) / numThreads; // Integer division handles distribution
+	int endSurface = (numsurfaces * (threadId + 1)) / numThreads;
+
+	// This loop is now thread-safe as each thread works on its own data
+	for ( i = startSurface ; i < endSurface ; i++ ) {
 
 		if ( *surfaces[i] == SF_GRID ) {
 
@@ -743,8 +779,8 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 
 					// add the fragments of this face
 					R_AddMarkFragments( 3, clipPoints,
-										numPlanes, lnormals, ldists,
-										maxPoints, pointBuffer,
+										numPlanes, (vec3_t *)lnormals, ldists,
+										maxPoints, (float *)pointBuffer,
 										maxFragments, fragmentBuffer,
 										&returnedPoints, &returnedFragments, lmins, lmaxs );
 
@@ -780,8 +816,8 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 					}
 					// add the fragments of this face
 					R_AddMarkFragments( 3, clipPoints,
-										numPlanes, normals, dists,
-										maxPoints, pointBuffer,
+										numPlanes, (vec3_t *)normals, dists,
+										maxPoints, (float *)pointBuffer,
 										maxFragments, fragmentBuffer,
 										&returnedPoints, &returnedFragments, mins, maxs );
 					if ( returnedFragments == maxFragments ) {
@@ -806,8 +842,8 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 
 				// add the fragments of this face
 				R_AddMarkFragments(3, clipPoints,
-								   numPlanes, normals, dists,
-								   maxPoints, pointBuffer,
+								   numPlanes, (vec3_t *)normals, dists,
+								   maxPoints, (float *)pointBuffer,
 								   maxFragments, fragmentBuffer, &returnedPoints, &returnedFragments, mins, maxs);
 				if(returnedFragments == maxFragments)
 				{
@@ -819,3 +855,195 @@ int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t project
 	return returnedFragments;
 }
 
+typedef struct {
+	int points;
+	int fragments;
+} worker_result_t;
+
+// Worker function for each thread
+static int R_MarkFragments_Worker(void *data)
+{
+	mark_thread_data_t *thread_data = (mark_thread_data_t *)data;
+
+	thread_data->returnedFragments = R_MarkFragments_Internal(
+		thread_data->orientation,
+		thread_data->points, 
+		thread_data->projection,
+		thread_data->maxPoints,
+		thread_data->pointBuffer,
+		thread_data->maxFragments,
+		thread_data->fragmentBuffer,
+		thread_data->threadId,
+		thread_data->numThreads,
+		thread_data->oldMapping,
+		thread_data->surfaces,
+		thread_data->numsurfaces);
+
+	// This is a bit of a hack to get the point count, since R_MarkFragments_Internal doesn't return it.
+	// We find it by looking at the last fragment generated.
+	if (thread_data->returnedFragments > 0) {
+		markFragment_t *lastFrag = &thread_data->fragmentBuffer[thread_data->returnedFragments - 1];
+		thread_data->returnedPoints = lastFrag->firstPoint + abs(lastFrag->numPoints);
+	} else {
+		thread_data->returnedPoints = 0;
+	}
+
+	return thread_data->returnedFragments;
+}
+
+// Helper function to get the number of logical processors in a cross-platform way.
+static int R_GetHardwareThreadCount(void) {
+	int num_processors = 1; // Default to 1
+#if defined(_WIN32)
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	num_processors = sysinfo.dwNumberOfProcessors;
+#elif defined(__unix__) || defined(__APPLE__)
+	num_processors = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+	if (num_processors < 1) {
+		return 1;
+	}
+	return num_processors;
+}
+/*
+=================
+R_MarkFragments
+
+Public facing function, dispatches work to threads.
+=================
+*/
+int R_MarkFragments( int orientation, const vec3_t *points, const vec3_t projection,
+					 int maxPoints, vec3_t pointBuffer, int maxFragments, markFragment_t *fragmentBuffer ) {
+
+	int numThreads = R_GetHardwareThreadCount();
+
+	qboolean oldMapping = qfalse;
+	if ( maxFragments < 0 ) {
+		maxFragments = -maxFragments;
+		oldMapping = qtrue;
+	}
+
+	if (numThreads <= 1) {
+		surfaceType_t *surfaces[4096];
+		int numsurfaces = 0;
+		vec3_t mins, maxs, projectionDir;
+
+		tr.viewCount++; // increment view count for double check prevention
+
+		// This logic is duplicated from the multi-threaded path to gather surfaces first.
+		VectorNormalize2( projection, projectionDir );
+		ClearBounds( mins, maxs );
+		AddPointToBounds( points[0], mins, maxs ); // Simplified for single point
+		R_BoxSurfaces_r( tr.world->nodes, mins, maxs, surfaces, 4096, &numsurfaces, projectionDir );
+
+		return R_MarkFragments_Internal(orientation, points, projection, maxPoints, (float *)pointBuffer, oldMapping ? -maxFragments : maxFragments, fragmentBuffer, 0, 1, oldMapping, surfaces, numsurfaces);
+	}
+
+	thrd_t *threads = calloc(numThreads, sizeof(thrd_t));
+	mark_thread_data_t *thread_data = calloc(numThreads, sizeof(mark_thread_data_t));
+
+	// Allocate temporary buffers for each thread
+	float** tempPointBuffers = calloc(numThreads, sizeof(float*));
+	markFragment_t **tempFragmentBuffers = calloc(numThreads, sizeof(markFragment_t*));
+
+	// Step 1: Main thread gathers all potential surfaces first. This is critical.
+	surfaceType_t *surfaces[4096];
+	int numsurfaces = 0;
+	vec3_t mins, maxs, projectionDir;
+	float radius = VectorNormalize2( projection, projectionDir ) / 2.0;
+
+	tr.viewCount++; // Needs to be done once before R_BoxSurfaces_r
+
+	ClearBounds( mins, maxs );
+	for ( int i = 0 ; i < 4 ; i++ ) { // Assuming 4 points
+		vec3_t temp;
+		AddPointToBounds( points[i], mins, maxs );
+		VectorMA( points[i], 1 * ( 1 + oldMapping * radius * 4 ), projection, temp );
+		AddPointToBounds( temp, mins, maxs );
+		VectorMA( points[i], -20 * ( 1.0 + (float)oldMapping * ( radius / 20.0 ) * 4 ), projectionDir, temp );
+		AddPointToBounds( temp, mins, maxs );
+	}
+	R_BoxSurfaces_r( tr.world->nodes, mins, maxs, surfaces, 4096, &numsurfaces, projectionDir );
+
+	if (numsurfaces == 0) {
+		return 0;
+	}
+
+	for (int i = 0; i < numThreads; i++) {
+		// Use Z_Malloc as it's the engine's memory manager, it returns zeroed memory.
+		tempPointBuffers[i] = calloc(maxPoints * 5, sizeof(float));
+		tempFragmentBuffers[i] = calloc(maxFragments, sizeof(markFragment_t));
+
+		thread_data[i].threadId = i;
+		thread_data[i].numThreads = numThreads;
+		thread_data[i].orientation = orientation;
+		thread_data[i].points = points;
+		VectorCopy(projection, thread_data[i].projection);
+		thread_data[i].maxPoints = maxPoints;
+		thread_data[i].maxFragments = maxFragments;
+		thread_data[i].oldMapping = oldMapping;
+		thread_data[i].surfaces = surfaces;
+		thread_data[i].numsurfaces = numsurfaces;
+		thread_data[i].pointBuffer = tempPointBuffers[i];
+		thread_data[i].fragmentBuffer = tempFragmentBuffers[i];
+		thread_data[i].returnedPoints = 0;
+		thread_data[i].returnedFragments = 0;
+
+		if (thrd_create(&threads[i], R_MarkFragments_Worker, &thread_data[i]) != thrd_success) {
+			// Fallback to single-threaded on failure
+			for(int j = 0; j < i; j++) { // Free already allocated memory
+				free(tempPointBuffers[j]);
+				free(tempFragmentBuffers[j]);
+			}
+			free(threads);
+			free(thread_data);
+			free(tempPointBuffers);
+			free(tempFragmentBuffers);
+			free(tempPointBuffers[i]);
+			free(tempFragmentBuffers[i]);
+			// Fallback by running on main thread
+			return R_MarkFragments_Internal(orientation, points, projection, maxPoints, (float *)pointBuffer, oldMapping ? -maxFragments : maxFragments, fragmentBuffer, 0, 1, oldMapping, surfaces, numsurfaces);
+		}
+	}
+
+	// Step 2: Wait for all threads to complete.
+	for (int i = 0; i < numThreads; i++) {
+		thrd_join(threads[i], NULL);
+	}
+
+	// Step 3: Merge results from all threads.
+	int totalFragments = 0;
+	int totalPoints = 0;
+
+	for (int i = 0; i < numThreads; i++) {
+		int pointsInThread = thread_data[i].returnedPoints;
+		int fragmentsInThread = thread_data[i].returnedFragments;
+
+		if (fragmentsInThread > 0 && (totalFragments + fragmentsInThread) <= maxFragments) {
+			// Copy fragments
+			for (int j = 0; j < fragmentsInThread; j++) {
+				markFragment_t *destFrag = &fragmentBuffer[totalFragments + j];
+				markFragment_t *srcFrag = &tempFragmentBuffers[i][j];
+				*destFrag = *srcFrag;
+				destFrag->firstPoint += totalPoints; // Offset the point index
+			}
+			// Copy points
+			if (pointsInThread > 0 && (totalPoints + pointsInThread) <= maxPoints) {
+				memcpy((float *)pointBuffer + totalPoints * 5, tempPointBuffers[i], pointsInThread * 5 * sizeof(float));
+				totalPoints += pointsInThread;
+			}
+			totalFragments += fragmentsInThread;
+		}
+
+		free(tempPointBuffers[i]); // Free temporary buffers
+		free(tempFragmentBuffers[i]);
+	}
+
+	free(threads);
+	free(thread_data);
+	free(tempPointBuffers);
+	free(tempFragmentBuffers);
+
+	return totalFragments;
+}
