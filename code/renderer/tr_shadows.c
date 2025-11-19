@@ -28,6 +28,11 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <threads.h>
+#include <stdatomic.h>
 
 /*
 
@@ -61,14 +66,14 @@ static int idx = 0;
 void R_AddEdgeDef( int i1, int i2, int facing ) {
 	int c;
 
-	c = numEdgeDefs[ i1 ];
+	c = atomic_fetch_add(&numEdgeDefs[ i1 ], 1);
 	if ( c == MAX_EDGE_DEFS ) {
+		atomic_fetch_sub(&numEdgeDefs[i1], 1);
 		return;     // overflow
 	}
 	edgeDefs[ i1 ][ c ].i2 = i2;
 	edgeDefs[ i1 ][ c ].facing = facing;
 
-	numEdgeDefs[ i1 ]++;
 }
 
 void R_RenderShadowEdges( void ) {
@@ -172,6 +177,65 @@ void R_RenderShadowEdges( void ) {
 }
 
 /*
+===========================================================================
+Shadow calculation threads
+===========================================================================
+*/
+
+typedef struct {
+	int start_vert;
+	int end_vert;
+	vec3_t lightDir;
+} shadow_projection_worker_t;
+
+int R_ShadowProjectionWorker(void *data) {
+	shadow_projection_worker_t *w = (shadow_projection_worker_t *)data;
+	for (int i = w->start_vert; i < w->end_vert; i++) {
+		VectorMA(tess.xyz[i], -512, w->lightDir, shadowXyz[i]);
+	}
+	return 0;
+}
+
+typedef struct {
+	int start_tri;
+	int end_tri;
+	vec3_t lightDir;
+} shadow_facing_worker_t;
+
+int R_ShadowFacingWorker(void *data) {
+	shadow_facing_worker_t *w = (shadow_facing_worker_t *)data;
+	int i;
+
+	for (i = w->start_tri; i < w->end_tri; i++) {
+		int i1, i2, i3;
+		vec3_t d1, d2, normal;
+		float *v1, *v2, *v3;
+		float d;
+
+		i1 = tess.indexes[i * 3 + 0];
+		i2 = tess.indexes[i * 3 + 1];
+		i3 = tess.indexes[i * 3 + 2];
+
+		v1 = tess.xyz[i1];
+		v2 = tess.xyz[i2];
+		v3 = tess.xyz[i3];
+
+		VectorSubtract(v2, v1, d1);
+		VectorSubtract(v3, v1, d2);
+		CrossProduct(d1, d2, normal);
+
+		d = DotProduct(normal, w->lightDir);
+		facing[i] = (d > 0);
+
+		// create the edges
+		R_AddEdgeDef(i1, i2, facing[i]);
+		R_AddEdgeDef(i2, i3, facing[i]);
+		R_AddEdgeDef(i3, i1, facing[i]);
+	}
+	return 0;
+}
+
+/*
 =================
 RB_ShadowTessEnd
 
@@ -195,45 +259,53 @@ void RB_ShadowTessEnd( void ) {
 
 	VectorCopy( backEnd.currentEntity->lightDir, lightDir );
 
+	int num_threads = TR_GetHardwareThreadCount();
+	thrd_t *threads = (thrd_t *) malloc(num_threads * sizeof(thrd_t));
+
 	// project vertexes away from light direction
-	for ( i = 0 ; i < tess.numVertexes ; i++ ) {
-		VectorMA( tess.xyz[i], -512, lightDir, shadowXyz[i] );
+	shadow_projection_worker_t *proj_workers = (shadow_projection_worker_t *) malloc(num_threads * sizeof(shadow_projection_worker_t));
+	memset(proj_workers, 0, num_threads * sizeof(shadow_projection_worker_t));
+	int verts_per_thread = (tess.numVertexes + num_threads - 1) / num_threads;
+
+	for (i = 0; i < num_threads; i++) {
+		proj_workers[i].start_vert = i * verts_per_thread;
+		proj_workers[i].end_vert = (i + 1) * verts_per_thread;
+		VectorCopy(lightDir, proj_workers[i].lightDir);
+		if (proj_workers[i].end_vert > tess.numVertexes) {
+			proj_workers[i].end_vert = tess.numVertexes;
+		}
+		thrd_create(&threads[i], R_ShadowProjectionWorker, &proj_workers[i]);
+	}
+
+	for (i = 0; i < num_threads; i++) {
+		thrd_join(threads[i], NULL);
 	}
 
 	// decide which triangles face the light
-	memset( numEdgeDefs, 0, 4 * tess.numVertexes );
+	memset( numEdgeDefs, 0, sizeof(int) * tess.numVertexes );
 
 	numTris = tess.numIndexes / 3;
-	for ( i = 0 ; i < numTris ; i++ ) {
-		int i1, i2, i3;
-		vec3_t d1, d2, normal;
-		float   *v1, *v2, *v3;
-		float d;
+	shadow_facing_worker_t *face_workers = (shadow_facing_worker_t *) malloc(num_threads * sizeof(shadow_facing_worker_t));
+	memset(face_workers, 0, num_threads * sizeof(shadow_facing_worker_t));
+	int tris_per_thread = (numTris + num_threads - 1) / num_threads;
 
-		i1 = tess.indexes[ i * 3 + 0 ];
-		i2 = tess.indexes[ i * 3 + 1 ];
-		i3 = tess.indexes[ i * 3 + 2 ];
-
-		v1 = tess.xyz[ i1 ];
-		v2 = tess.xyz[ i2 ];
-		v3 = tess.xyz[ i3 ];
-
-		VectorSubtract( v2, v1, d1 );
-		VectorSubtract( v3, v1, d2 );
-		CrossProduct( d1, d2, normal );
-
-		d = DotProduct( normal, lightDir );
-		if ( d > 0 ) {
-			facing[ i ] = 1;
-		} else {
-			facing[ i ] = 0;
+	for (i = 0; i < num_threads; i++) {
+		face_workers[i].start_tri = i * tris_per_thread;
+		face_workers[i].end_tri = (i + 1) * tris_per_thread;
+		VectorCopy(lightDir, face_workers[i].lightDir);
+		if (face_workers[i].end_tri > numTris) {
+			face_workers[i].end_tri = numTris;
 		}
-
-		// create the edges
-		R_AddEdgeDef( i1, i2, facing[ i ] );
-		R_AddEdgeDef( i2, i3, facing[ i ] );
-		R_AddEdgeDef( i3, i1, facing[ i ] );
+		thrd_create(&threads[i], R_ShadowFacingWorker, &face_workers[i]);
 	}
+
+	for (i = 0; i < num_threads; i++) {
+		thrd_join(threads[i], NULL);
+	}
+
+	free(threads);
+	free(proj_workers);
+	free(face_workers);
 
 	// draw the silhouette edges
 
