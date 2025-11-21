@@ -35,6 +35,11 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "tr_local.h"
 
+#if __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+#include <threads.h>
+#define USE_C11_THREADS 1
+#endif
+
 static byte s_intensitytable[256];
 static unsigned char s_gammatable[256];
 
@@ -324,6 +329,64 @@ Bilinear Interpolation
 */
 #define USE_ANOTHER_RESAMPLE	1
 #if USE_ANOTHER_RESAMPLE
+
+#ifdef USE_C11_THREADS
+typedef struct {
+	unsigned *in;
+	int inwidth;
+	int inheight;
+	unsigned *out;
+	int outwidth;
+	int outheight;
+	int start_y;
+	int end_y;
+	int x_scale;
+	int y_scale;
+} ResampleThreadData;
+
+static int ResampleTexture_Thread(void *arg) {
+	ResampleThreadData *data = (ResampleThreadData *)arg;
+
+	for (int y = data->start_y; y < data->end_y; y++) {
+		int y_fp = y * data->y_scale;
+		int y_int = y_fp >> 16;
+		int y_frac = (y_fp & 0xFFFF) >> 8;
+
+		int y0 = y_int;
+		int y1 = (y_int < data->inheight - 1) ? y_int + 1 : y_int;
+
+		for (int x = 0; x < data->outwidth; x++) {
+			int x_fp = x * data->x_scale;
+			int x_int = x_fp >> 16;
+			int x_frac = (x_fp & 0xFFFF) >> 8;
+
+			int x0 = x_int;
+			int x1 = (x_int < data->inwidth - 1) ? x_int + 1 : x_int;
+
+			unsigned p00 = data->in[y0 * data->inwidth + x0];
+			unsigned p01 = data->in[y0 * data->inwidth + x1];
+			unsigned p10 = data->in[y1 * data->inwidth + x0];
+			unsigned p11 = data->in[y1 * data->inwidth + x1];
+
+			byte *c00 = (byte*)&p00;
+			byte *c01 = (byte*)&p01;
+			byte *c10 = (byte*)&p10;
+			byte *c11 = (byte*)&p11;
+
+			byte result[4];
+			for (int i = 0; i < 4; i++) {
+				int p0_weighted = c00[i] * (256 - x_frac) + c01[i] * x_frac;
+				int p1_weighted = c10[i] * (256 - x_frac) + c11[i] * x_frac;
+				result[i] = (p0_weighted * (256 - y_frac) + p1_weighted * y_frac) >> 16;
+			}
+
+			data->out[y * data->outwidth + x] = *(unsigned*)result;
+		}
+	}
+	return 0;
+}
+#endif // USE_C11_THREADS
+
 static void ResampleTexture(unsigned *in, int inwidth, int inheight, unsigned *out, int outwidth, int outheight) {
     if (inwidth == outwidth && inheight == outheight) {
         memcpy(out, in, inwidth * inheight * sizeof(unsigned));
@@ -334,6 +397,40 @@ static void ResampleTexture(unsigned *in, int inwidth, int inheight, unsigned *o
     int x_scale = (inwidth << 16) / outwidth;
     int y_scale = (inheight << 16) / outheight;
 
+#ifdef USE_C11_THREADS
+	int num_threads = TR_GetHardwareThreadCount();
+
+	if (num_threads > 1 && outheight >= num_threads) {
+		thrd_t *threads = ri.Hunk_AllocateTempMemory(sizeof(thrd_t) * num_threads);
+		ResampleThreadData *thread_data = ri.Hunk_AllocateTempMemory(sizeof(ResampleThreadData) * num_threads);
+
+		int rows_per_thread = outheight / num_threads;
+		int start_y = 0;
+
+		for (int i = 0; i < num_threads; i++) {
+			thread_data[i] = (ResampleThreadData){
+				.in = in, .inwidth = inwidth, .inheight = inheight,
+				.out = out, .outwidth = outwidth, .outheight = outheight,
+				.start_y = start_y,
+				.end_y = (i == num_threads - 1) ? outheight : start_y + rows_per_thread,
+				.x_scale = x_scale, .y_scale = y_scale
+			};
+			thrd_create(&threads[i], ResampleTexture_Thread, &thread_data[i]);
+			start_y += rows_per_thread;
+		}
+
+		for (int i = 0; i < num_threads; i++) {
+			thrd_join(threads[i], NULL);
+		}
+
+		ri.Hunk_FreeTempMemory(thread_data);
+		ri.Hunk_FreeTempMemory(threads);
+		return;
+	}
+	// Fallback to single-threaded if num_threads is 1 or not enough rows
+#endif
+
+	// Single-threaded implementation
     for (int y = 0; y < outheight; y++) {
         int y_fp = y * y_scale;
         int y_int = y_fp >> 16;
@@ -2797,4 +2894,3 @@ void R_CropImages_f( void ) {
 #endif
 }
 // done.
-
